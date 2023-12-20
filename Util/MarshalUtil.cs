@@ -5,49 +5,33 @@ namespace Miko.Util;
 
 unsafe static class MarshalUtil
 {
-    public static nint StringArrayToHGlobalAnsi(string[] array)
+    public static nint StringToHGlobalUtf8(string str)
     {
-        int[] lengths = array.Select(s => Encoding.UTF8.GetMaxByteCount(s.Length) + 1).ToArray();
-        int totalLength = lengths.Sum();
+        int length = Encoding.UTF8.GetByteCount(str) + 1;
+        nint pointer = Marshal.AllocHGlobal(length);
 
-        nint bytesPtr = Marshal.AllocHGlobal(totalLength);
-        var bytes = new Span<byte>((void*)bytesPtr, totalLength);
-
-        int offset = 0;
-        for (int i = 0; i < array.Length; i++)
-        {
-            StringIntoSpan(array[i], bytes.Slice(offset, lengths[i]));
-            offset += lengths[i];
-        }
-
-        return bytesPtr;
+        Span<byte> utf8Bytes = new((void*)pointer, length);
+        Encoding.UTF8.GetBytes(str, utf8Bytes);
+        utf8Bytes[length - 1] = 0;  // null terminator
+        
+        return pointer;
     }
 
-    public static unsafe void StringIntoSpan(string? input, Span<byte> span)
+    public static nint StringArrayToHGlobalUtf8(IList<string> array)
     {
-        int convertedBytes = 0;
-        fixed (char* firstChar = input)
-        {
-            fixed (byte* bytes = span)
-            {
-                convertedBytes = Encoding.UTF8.GetBytes(firstChar, input.Length, bytes, span.Length - 1);
-            }
-        }
-
-        span[convertedBytes] = 0;
-    }
-}
-
-unsafe class AutoReleasePointer(nint pointer) : IDisposable
-{
-    public nint Pointer { get; private set; } = pointer;
-
-    public void Dispose()
-    {
-        Marshal.FreeHGlobal(Pointer);
-        Pointer = nint.Zero;
+        nint pointerArrayPtr = Marshal.AllocHGlobal(sizeof(nint) * array.Count);
+        Span<nint> pointerArray = new((void*)pointerArrayPtr, array.Count);
+    
+        for (int i = 0; i < array.Count; i++)
+            pointerArray[i] = StringToHGlobalUtf8(array[i]);
+        return pointerArrayPtr;
     }
 
-    public static implicit operator nint(AutoReleasePointer ptr) => ptr.Pointer;
-    public static implicit operator void*(AutoReleasePointer ptr) => (void*)ptr.Pointer;
+    public static void FreeHGlobalArray(nint pointer, int length)
+    {
+        Span<nint> pointers = new((void*)pointer, length);
+        foreach (nint ptr in pointers)
+            Marshal.FreeHGlobal(ptr);
+        Marshal.FreeHGlobal(pointer);
+    }
 }

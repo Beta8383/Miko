@@ -4,11 +4,12 @@ using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 using Buffer = Silk.NET.Vulkan.Buffer;
 
-namespace Miko.Vulkan.Extensions;
+namespace Miko.Extension.Vulkan;
 
 unsafe static class VkExtensions
 {
-    public static bool CheckExtensionSupport(this Vk vkapi, string[] extensionsName)
+    #region Check
+    public static bool CheckExtensionSupport(this Vk vkapi, List<string> extensionsName)
     {
         //Get available extensions
         Span<uint> extensionCount = stackalloc uint[1];
@@ -23,7 +24,7 @@ unsafe static class VkExtensions
         return extensionsName.All(availableExtensionNames.Contains);
     }
 
-    public static bool CheckValidationLayerSupport(this Vk vkapi, string[] layersName)
+    public unsafe static bool CheckValidationLayerSupport(this Vk vkapi, string[] layersName)
     {
         //Get available layers
         Span<uint> layerCount = stackalloc uint[1];
@@ -36,7 +37,9 @@ unsafe static class VkExtensions
 
         return layersName.All(availableLayerNames.Contains);
     }
+    #endregion
 
+    #region Device
     public static IEnumerable<uint?> PhysicalDeviceFindQueueFamilies(this Vk vkapi, PhysicalDevice device, QueueFlags flags)
     {
         Span<uint> queueFamilyCount = stackalloc uint[1];
@@ -45,9 +48,19 @@ unsafe static class VkExtensions
         var queueFamilies = new QueueFamilyProperties[(int)queueFamilyCount[0]];
         vkapi.GetPhysicalDeviceQueueFamilyProperties(device, queueFamilyCount, queueFamilies);
 
+        Debug.WriteLine("Queue Families:");
+        foreach (var queueFamily in queueFamilies)
+            Debug.WriteLine($"Flags: {queueFamily.QueueFlags}");
+
         for (uint i = 0; i < queueFamilies.Length; i++)
             if (queueFamilies[i].QueueFlags.HasFlag(flags))
                 yield return i;
+    }
+
+    private static string GetDeviceName(this Vk vkapi, PhysicalDevice device)
+    {
+        vkapi.GetPhysicalDeviceProperties(device, out PhysicalDeviceProperties deviceProperties);
+        return Marshal.PtrToStringAnsi((nint)deviceProperties.DeviceName) ?? "Unknown Device";
     }
 
     public static IEnumerable<(PhysicalDevice, uint)> GetPhysicalDeviceWithQueueFamilies(this Vk vkapi, Instance instance, QueueFlags flags)
@@ -61,11 +74,16 @@ unsafe static class VkExtensions
         var devices = new PhysicalDevice[(int)deviceCount[0]];
         vkapi.EnumeratePhysicalDevices(instance, deviceCount, devices);
 
-        for (int i = 0; i < devices.Length; i++)
-            if (vkapi.PhysicalDeviceFindQueueFamilies(devices[i], flags).FirstOrDefault() is uint queueFamilyIndex)
-                yield return (devices[i], queueFamilyIndex);
+        foreach (var device in devices)
+        {
+            Debug.WriteLine($"Device: {vkapi.GetDeviceName(device)}");
+            if (vkapi.PhysicalDeviceFindQueueFamilies(device, flags).FirstOrDefault() is uint queueFamilyIndex)
+                yield return (device, queueFamilyIndex);
+        }
     }
+    #endregion
 
+    #region Memory
     public static uint FindMemoryType(this Vk vkapi, PhysicalDevice device, MemoryRequirements requirements, MemoryPropertyFlags flags)
     {
         PhysicalDeviceMemoryProperties memProperties;
@@ -81,7 +99,7 @@ unsafe static class VkExtensions
     public static DeviceMemory AllocateMemory(this Vk vkapi, PhysicalDevice physicalDevice, Device device, Buffer buffer, MemoryPropertyFlags flags)
     {
         MemoryRequirements memoryRequirements = vkapi.GetBufferMemoryRequirements(device, buffer);
-        Debug.WriteLine($"MemoryRequirements: Size: {memoryRequirements.Size} Alignment: {memoryRequirements.Alignment} MemoryTypeBits:{memoryRequirements.MemoryTypeBits}");
+        Debug.WriteLine($"MemoryRequirements: Size: {memoryRequirements.Size} Alignment: {memoryRequirements.Alignment}");
 
         MemoryAllocateInfo allocateInfo = new()
         {
@@ -104,7 +122,7 @@ unsafe static class VkExtensions
         if (vkapi.MapMemory(device, memory, 0, (ulong)(sizeof(T) * data.Length), 0, ref mappedMemory) != Result.Success)
             throw new Exception("Failed to map memory!");
 
-        Unsafe.CopyBlock(mappedMemory, Unsafe.AsPointer(ref data[0]), (uint)(sizeof(float) * data.Length));
+        Unsafe.CopyBlock(mappedMemory, Unsafe.AsPointer(ref data[0]), (uint)(sizeof(T) * data.Length));
 
         vkapi.UnmapMemory(device, memory);
     }
@@ -115,8 +133,9 @@ unsafe static class VkExtensions
         if (vkapi.MapMemory(device, memory, 0, (ulong)(sizeof(T) * data.Length), 0, ref mappedMemory) != Result.Success)
             throw new Exception("Failed to map memory!");
 
-        Unsafe.CopyBlock(Unsafe.AsPointer(ref data[0]), mappedMemory, (uint)(sizeof(float) * data.Length));
+        Unsafe.CopyBlock(Unsafe.AsPointer(ref data[0]), mappedMemory, (uint)(sizeof(T) * data.Length));
 
         vkapi.UnmapMemory(device, memory);
     }
+    #endregion
 }

@@ -1,5 +1,7 @@
 using Silk.NET.Vulkan;
 
+namespace Miko;
+
 static class Global
 {
     public static Vk VkApi;
