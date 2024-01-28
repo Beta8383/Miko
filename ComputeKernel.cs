@@ -5,37 +5,15 @@ using Silk.NET.Core;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Buffer = Silk.NET.Vulkan.Buffer;
-using static Miko.Global;
 using System.Runtime.CompilerServices;
 using Miko.Extension.Vulkan;
-using Miko.HLSLBuffer;
+using Miko.HLSLBuffers;
+using Miko.VkInstanceInfo;
+using static Miko.Global;
 
 namespace Miko;
 
-readonly struct BufferInfo(Buffer instance, DeviceMemory memory, ulong size, bool uniform)
-{
-    public readonly Guid Guid = Guid.NewGuid();
-    public readonly Buffer Instance = instance;
-    public readonly DeviceMemory Memory = memory;
-    public readonly ulong Size = size;
-    public readonly bool Uniform = uniform;
-}
-
-readonly struct ShaderModuleInfo(ShaderModule instance, string functionName = "main")
-{
-    public readonly Guid Guid = Guid.NewGuid();
-    public readonly ShaderModule Instance = instance;
-    public readonly string FunctionName = functionName;
-}
-
-readonly struct PipelineInfo(PipelineLayout layout, Pipeline instance)
-{
-    public readonly Guid Guid = Guid.NewGuid();
-    public readonly PipelineLayout Layout = layout;
-    public readonly Pipeline Instance = instance;
-}
-
-unsafe class ComputeKernel
+unsafe class ComputeKernel : IDisposable
 {
     const uint StorageBufferCount = 20;
     const uint UniformBufferCount = 10;
@@ -52,14 +30,18 @@ unsafe class ComputeKernel
     uint _queueFamilyIndex;
     Queue _queue;
     CommandPool _commandPool;
-
     DescriptorPool _descriptorPool;
 
-    readonly HashSet<Guid> _bufferInfos = [];
-    readonly HashSet<Guid> _shaderModuleInfos = [];
-    readonly HashSet<Guid> _pipelineInfos = [];
+    readonly Dictionary<Guid, DeviceMemory> _memory = [];
+    readonly Dictionary<Guid, Buffer> _buffers = [];
 
-    readonly HashSet<(DeviceMemory, Buffer)> _memory = [];
+    readonly Dictionary<Guid, DescriptorSetLayout> _descriptorSetLayouts = [];
+    readonly Dictionary<Guid, DescriptorSet> _descriptorSets = [];
+
+    readonly Dictionary<Guid, ShaderModule> _shaderModules = [];
+
+    readonly Dictionary<Guid, PipelineLayout> _pipelineLayouts = [];
+    readonly Dictionary<Guid, Pipeline> _pipelines = [];
 
     public ComputeKernel(uint kernalCount, bool enableValidationLayers = false)
     {
@@ -147,7 +129,8 @@ unsafe class ComputeKernel
 
     private void CreateDeviceWithQueue()
     {
-        (_physicalDevice, _queueFamilyIndex) = VkApi.GetPhysicalDeviceWithQueueFamilies(_instance, QueueFlags.ComputeBit).First();
+        (_physicalDevice, _queueFamilyIndex) = VkApi.GetPhysicalDeviceWithQueueFamilies(_instance, QueueFlags.ComputeBit).FirstOrDefault()
+                                               ?? throw new Exception("Failed to find suitable device!");
 
         float queuePriority = 1.0f;
         var queueCreateInfo = new DeviceQueueCreateInfo
@@ -226,109 +209,154 @@ unsafe class ComputeKernel
 
     #endregion
 
-    internal void AllocateMemory(IList<Buffer> buffers)
-    {
-        MemoryRequirements combinedMemoryRequirements = new(0, 0, 0);
-        MemoryRequirements[] memoryRequirements = new MemoryRequirements[buffers.Count];
-        for (int i = 0; i < buffers.Count; i++)
-        {
-            VkApi.GetBufferMemoryRequirements(_device, buffers[i], out memoryRequirements[i]);
-            combinedMemoryRequirements.Size += memoryRequirements[i].Size;
-            combinedMemoryRequirements.Alignment = Math.Max(combinedMemoryRequirements.Alignment, memoryRequirements[i].Alignment);
-            combinedMemoryRequirements.MemoryTypeBits |= memoryRequirements[i].MemoryTypeBits;
-        }
-        Debug.WriteLine($"MemoryRequirements: Size: {combinedMemoryRequirements.Size} Alignment: {combinedMemoryRequirements.Alignment}");
-
-        MemoryAllocateInfo allocateInfo = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = combinedMemoryRequirements.Size,
-            MemoryTypeIndex = VkApi.FindMemoryType(_physicalDevice, combinedMemoryRequirements, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit)
-        };
-
-        if (VkApi.AllocateMemory(_device, &allocateInfo, null, out DeviceMemory memory) != Result.Success)
-            throw new Exception("Failed to allocate buffer memory!");
-
-        //BindBufferMemory
-        ulong offset = 0;
-        for (int i = 0; i < buffers.Count; i++)
-        {
-            VkApi.BindBufferMemory(_device, buffers[i], memory, offset);
-            offset += memoryRequirements[i].Size;
-        }
-    }
-
-    #region Buffer
-
-    public BufferInfo AllocateBuffer(ulong size)
+    internal Guid CreateBuffer(ulong size, BufferUsageFlags bufferUsage)
     {
         BufferCreateInfo bufferCreateInfo = new()
         {
             SType = StructureType.BufferCreateInfo,
             Size = size,
-            Usage = BufferUsageFlags.UniformBufferBit | BufferUsageFlags.StorageBufferBit,
+            Usage = bufferUsage,
             SharingMode = SharingMode.Exclusive
         };
 
-        if (VkApi.CreateBuffer(_device, &bufferCreateInfo, null, out var buffer) != Result.Success)
+        if (VkApi.CreateBuffer(_device, in bufferCreateInfo, null, out var vkbuffer) != Result.Success)
             throw new Exception("Failed to create buffer!");
 
-        
-        DeviceMemory memory = VkApi.AllocateMemory(_physicalDevice, _device, buffer, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
-        var bufferInfo = new BufferInfo(buffer, memory, size, true);
-        _bufferInfos.Add(bufferInfo.Guid);
-        return bufferInfo;
+        Guid guid = Guid.NewGuid();
+        _buffers.Add(guid, vkbuffer);
+        return guid;
     }
 
-    public void WriteDataIntoBuffer<T>(BufferInfo info, Span<T> data) where T : unmanaged
+    /*
+    internal void WriteBuffer(Guid bufferId, uint count)
     {
-        if (!_bufferInfos.Contains(info.Guid))
-            throw new Exception("Buffer not found!");
-
-        if (info.Size < (ulong)(sizeof(T) * data.Length))
-            throw new Exception("Data size is larger than buffer size!");
-
-        VkApi.WriteMemory(_device, info.Memory, data);
+        void* source = Unsafe.AsPointer(ref data[0]);
+        TemporaryMapMemory(buffer, mappedMemory => Unsafe.CopyBlock(mappedMemory, source, count));
     }
 
-    public void ReadDataFromBuffer<T>(BufferInfo info, Span<T> data) where T : unmanaged
+    internal void WriteBuffer<T>(HLSLBuffer buffer, Span<T> data) where T : unmanaged
     {
-        if (!_bufferInfos.Contains(info.Guid))
-            throw new Exception("Buffer not found!");
-
-        if (info.Size > (ulong)(sizeof(T) * data.Length))
-            throw new Exception("Buffer size is larger than data size!");
-
-        VkApi.ReadMemory(_device, info.Memory, data);
+        void* source = Unsafe.AsPointer(ref data[0]);
+        TemporaryMapMemory(buffer, mappedMemory => Unsafe.CopyBlock(mappedMemory, source, (uint)buffer.Size));
     }
 
-    public void FreeBuffer(BufferInfo info)
+    internal void WriteBuffer<T>(HLSLBuffer buffer, T data) where T : unmanaged
     {
-        if (!_bufferInfos.Contains(info.Guid))
-            throw new Exception("Buffer not found!");
-
-        VkApi.DestroyBuffer(_device, info.Instance, null);
-        VkApi.FreeMemory(_device, info.Memory, null);
-        _bufferInfos.Remove(info.Guid);
+        void* source = Unsafe.AsPointer(ref data);
+        TemporaryMapMemory(buffer, mappedMemory => Unsafe.CopyBlock(mappedMemory, source, (uint)buffer.Size));
     }
 
+    internal void ReadBuffer<T>(HLSLBuffer buffer, out T[] data) where T : unmanaged
+    {
+        data = new T[(int)buffer.Size / sizeof(T)];
+        void* destination = Unsafe.AsPointer(ref data[0]);
+        TemporaryMapMemory(buffer, mappedMemory => Unsafe.CopyBlock(destination, mappedMemory, (uint)buffer.Size));
+    }
+
+    internal void ReadBuffer<T>(HLSLBuffer buffer, out T data) where T : unmanaged
+    {
+        data = default;
+        void* destination = Unsafe.AsPointer(ref data);
+        TemporaryMapMemory(buffer, mappedMemory => Unsafe.CopyBlock(destination, mappedMemory, (uint)buffer.Size));
+    }
+    */
+
+    #region Memory
+    /*
+    public MemoryInfo[] AllocateMemory(HLSLBuffer[] buffers)
+    {
+        // Get memory requirements for each buffer
+        MemoryRequirements[] bufferMemoryRequirements = new MemoryRequirements[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++)
+            VkApi.GetBufferMemoryRequirements(_device, _buffers[buffers[i].Id], out bufferMemoryRequirements[i]);
+
+        // Group by alignment
+        // IGrouping<ulong alignment, (HLSLBuffer, MemoryRequirements)>[]
+        var groupByAlignment = buffers.Zip(bufferMemoryRequirements, (first, second) => new { Buffer = first, MemoryRequirement = second })
+                                      .GroupBy(x => x.MemoryRequirement.Alignment)
+                                      .ToArray();
+
+        // Combine buffer with same alignment into one DeviceMemory
+        var combinedBufferMemoryRequirements = groupByAlignment.Select(group => new MemoryRequirements()
+        {
+            Alignment = group.Key,
+            Size = group.Aggregate(0ul, (acc, y) => acc + y.MemoryRequirement.Size),
+            MemoryTypeBits = group.Aggregate(0u, (acc, y) => acc | y.MemoryRequirement.MemoryTypeBits)
+        }).ToArray();
+
+        var memoryInfos = AllocateMemory(combinedBufferMemoryRequirements);
+
+        // Assign DeviceMemoryId and Offset to HLSLBuffer
+        for (int memoryIndex = 0; memoryIndex < groupByAlignment.Length; memoryIndex++)
+        {
+            ulong offset = 0;
+            foreach (var group in groupByAlignment[memoryIndex])
+            {
+                var buffer = group.Buffer;
+                var bufferMemoryRequirement = group.MemoryRequirement;
+
+                buffer.DeviceMemoryId = memoryInfos[memoryIndex].Id;
+                buffer.Offset = offset;
+
+                memoryInfos[memoryIndex].BuffersId.Add(buffer.Id);
+                offset += bufferMemoryRequirement.Size;     //use the size after alignment rather than the original size
+            }
+        }
+
+        BindingBufferToMemory(buffers);
+
+        return memoryInfos;
+    }
+    */
+
+    internal Guid AllocateMemory(ulong size, uint memoryTypeIndex)
+    {
+        MemoryAllocateInfo allocateInfo = new()
+        {
+            SType = StructureType.MemoryAllocateInfo,
+            AllocationSize = size,
+            MemoryTypeIndex = memoryTypeIndex
+            //MemoryTypeIndex = VkApi.FindMemoryType(_physicalDevice, memoryRequirements[i].MemoryTypeBits, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit)
+        };
+
+        if (VkApi.AllocateMemory(_device, in allocateInfo, null, out var memory) != Result.Success)
+            throw new Exception("Failed to allocate buffer memory!");
+
+        Guid guid = Guid.NewGuid();
+        _memory.Add(guid, memory);
+
+        return guid;
+    }
+
+    internal void FreeMemory(Guid memoryId)
+    {
+        if (!_memory.TryGetValue(memoryId, out DeviceMemory memory))
+            throw new Exception("Memory not found!");
+
+        VkApi.FreeMemory(_device, memory, null);
+        _memory.Remove(memoryId);
+    }
+
+    private delegate void MappedMemoryAction(void* mappedMemory);
+
+    private void TemporaryMapMemory(Guid memoryId, ulong offset, ulong size, MappedMemoryAction action)
+    {
+        if (!_memory.TryGetValue(memoryId, out DeviceMemory memory))
+            throw new Exception("Memory not found!");
+
+        void* mappedMemory = null;
+        if (VkApi.MapMemory(_device, memory, offset, size, 0, ref mappedMemory) != Result.Success)
+            throw new Exception("Failed to map memory!");
+
+        action(mappedMemory);
+
+        VkApi.UnmapMemory(_device, memory);
+    }
     #endregion
 
     #region Descriptor Set
-    public DescriptorSetLayout CreateDescriptorSetLayout(int uniformBufferCount, int storageBufferCount)
+    internal Guid CreateDescriptorSetLayout(DescriptorSetLayoutBinding[] layoutBindings)
     {
-        var layoutBindings = new DescriptorSetLayoutBinding[uniformBufferCount + storageBufferCount];
-        for (int i = 0; i < uniformBufferCount + storageBufferCount; i++)
-        {
-            layoutBindings[i] = new DescriptorSetLayoutBinding
-            {
-                Binding = (uint)i,
-                DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.ComputeBit,
-                DescriptorType = i < uniformBufferCount ? DescriptorType.UniformBuffer : DescriptorType.StorageBuffer
-            };
-        }
-
         DescriptorSetLayoutCreateInfo layoutCreateInfo = new()
         {
             SType = StructureType.DescriptorSetLayoutCreateInfo,
@@ -338,10 +366,74 @@ unsafe class ComputeKernel
 
         if (VkApi.CreateDescriptorSetLayout(_device, in layoutCreateInfo, null, out var descriptorSetLayout) != Result.Success)
             throw new Exception("Failed to create descriptor set layout!");
+
+        Guid guid = Guid.NewGuid();
+        _descriptorSetLayouts.Add(guid, descriptorSetLayout);
+        return guid;
+    }
+
+    internal Guid AllocateDescriptorSet(Guid descriptorSetLayoutId)
+    {
+        if (_descriptorSetLayouts.TryGetValue(descriptorSetLayoutId, out var descriptorSetLayout))
+            throw new Exception("Descriptor set layout not found!");
+
+        DescriptorSetAllocateInfo allocateInfo = new()
+        {
+            SType = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool = _descriptorPool,
+            DescriptorSetCount = 1,
+            PSetLayouts = (DescriptorSetLayout*)Unsafe.AsPointer(ref descriptorSetLayout)
+        };
+
+        if (VkApi.AllocateDescriptorSets(_device, in allocateInfo, out var descriptorSet) != Result.Success)
+            throw new Exception("Failed to allocate descriptor set!");
+
+        Guid guid = Guid.NewGuid();
+        _descriptorSets.Add(guid, descriptorSet);
+        return guid;
+    }
+
+
+    public DescriptorSet CreateDescriptorSet<T>(T shaderBuffer)
+    {
+        var descriptorSetLayout = CreateDescriptorSetLayout(shaderBuffer);
+        var descriptorSet = AllocateDescriptorSet(descriptorSetLayout);
+        UpdateDescriptorSet(descriptorSet, shaderBuffer);
+        return descriptorSet;
+    }
+
+    private DescriptorSetLayout CreateDescriptorSetLayout<T>(T shaderBuffer)
+    {
+        if (_descriptorSetLayouts.TryGetValue(typeof(T).GUID, out var descriptorSetLayout))
+            return descriptorSetLayout;
+
+        var bindings = ShaderBufferMapper<T>.Bindings;
+        var layoutBindings = new DescriptorSetLayoutBinding[bindings.Count];
+
+        for (int i = 0; i < bindings.Count; i++)
+        {
+            HLSLBuffer HLSLbuffer = ShaderBufferMapper<T>.GetBuffer(shaderBuffer, bindings[i]);
+            layoutBindings[i].Binding = bindings[i];
+            layoutBindings[i].DescriptorCount = 1;
+            layoutBindings[i].StageFlags = ShaderStageFlags.ComputeBit;
+            layoutBindings[i].DescriptorType = HLSLbuffer.GetDescriptorType();
+        }
+
+        DescriptorSetLayoutCreateInfo layoutCreateInfo = new()
+        {
+            SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = (uint)layoutBindings.Length,
+            PBindings = (DescriptorSetLayoutBinding*)Unsafe.AsPointer(ref layoutBindings[0])
+        };
+
+        if (VkApi.CreateDescriptorSetLayout(_device, in layoutCreateInfo, null, out descriptorSetLayout) != Result.Success)
+            throw new Exception("Failed to create descriptor set layout!");
+
+        _descriptorSetLayouts.Add(typeof(T).GUID, descriptorSetLayout);
         return descriptorSetLayout;
     }
 
-    public DescriptorSet AllocateDescriptorSet(DescriptorSetLayout descriptorSetLayout)
+    private DescriptorSet AllocateDescriptorSet(DescriptorSetLayout descriptorSetLayout)
     {
         DescriptorSetAllocateInfo allocateInfo = new()
         {
@@ -357,31 +449,33 @@ unsafe class ComputeKernel
         return descriptorSet;
     }
 
-    public void UpdateDescriptorSet(DescriptorSet descriptorSet, BufferInfo[] srcBufferInfos)
+    public void UpdateDescriptorSet<T>(DescriptorSet descriptorSet, T shaderBuffer)
     {
-        var writeDescriptorSets = new WriteDescriptorSet[srcBufferInfos.Length];
-        var descriptorBufferInfo = new DescriptorBufferInfo[srcBufferInfos.Length];
-        uint index = 0;
-        for (int i = 0; i < srcBufferInfos.Length; i++)
+        var bindings = ShaderBufferMapper<T>.Bindings;
+        var descriptorBufferInfo = new DescriptorBufferInfo[bindings.Count];
+        var writeDescriptorSets = new WriteDescriptorSet[bindings.Count];
+
+        for (int i = 0; i < bindings.Count; i++)
         {
-            if (!_bufferInfos.Contains(srcBufferInfos[i].Guid))
+            HLSLBuffer HLSLbuffer = ShaderBufferMapper<T>.GetBuffer(shaderBuffer, bindings[i]);
+            if (!_buffers.TryGetValue(HLSLbuffer.Id, out var buffer))
                 throw new Exception("Buffer not found!");
 
             descriptorBufferInfo[i] = new()
             {
-                Buffer = srcBufferInfos[i].Instance,
-                Offset = 0,
-                Range = srcBufferInfos[i].Size
+                Buffer = buffer,
+                Offset = HLSLbuffer.Offset,
+                Range = HLSLbuffer.Size
             };
 
             writeDescriptorSets[i] = new()
             {
                 SType = StructureType.WriteDescriptorSet,
                 DstSet = descriptorSet,
-                DstBinding = index++,
+                DstBinding = bindings[i],
                 DstArrayElement = 0,
                 DescriptorCount = 1,
-                DescriptorType = srcBufferInfos[i].Uniform ? DescriptorType.UniformBuffer : DescriptorType.StorageBuffer,
+                DescriptorType = HLSLbuffer.GetDescriptorType(),
                 PBufferInfo = (DescriptorBufferInfo*)Unsafe.AsPointer(ref descriptorBufferInfo[i]),
             };
         }
@@ -396,6 +490,7 @@ unsafe class ComputeKernel
 
     #endregion
 
+    #region Shader Module
     public ShaderModuleInfo CreateShaderModule(Span<byte> shaderCode, string functionName = "main")
     {
         var shaderModuleCreateInfo = new ShaderModuleCreateInfo
@@ -408,45 +503,51 @@ unsafe class ComputeKernel
         if (VkApi.CreateShaderModule(_device, in shaderModuleCreateInfo, null, out var shaderModule) != Result.Success)
             throw new Exception("Failed to create compute shader module!");
 
-        var shaderModuleInfo = new ShaderModuleInfo(shaderModule, functionName);
-        _shaderModuleInfos.Add(shaderModuleInfo.Guid);
+        var shaderModuleInfo = new ShaderModuleInfo(functionName);
+        _shaderModules.Add(shaderModuleInfo.Guid, shaderModule);
         return shaderModuleInfo;
     }
 
     public void FreeShaderModule(ShaderModuleInfo shaderModuleInfo)
     {
-        if (!_shaderModuleInfos.Contains(shaderModuleInfo.Guid))
+        if (!_shaderModules.TryGetValue(shaderModuleInfo.Guid, out var shaderModule))
             throw new Exception("Shader module not found!");
 
-        VkApi.DestroyShaderModule(_device, shaderModuleInfo.Instance, null);
-        _shaderModuleInfos.Remove(shaderModuleInfo.Guid);
+        VkApi.DestroyShaderModule(_device, shaderModule, null);
+        _shaderModules.Remove(shaderModuleInfo.Guid);
     }
+    #endregion
 
     #region Pipeline
 
-    public PipelineLayout CreateComputePineLineLayout(DescriptorSetLayout descriptorSetLayout)
+    private PipelineLayout CreatePipelineLayout(DescriptorSetLayout descriptorSetLayout)
     {
         var pipelineLayoutCreateInfo = new PipelineLayoutCreateInfo
         {
             SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 1,
-            PSetLayouts = &descriptorSetLayout
+            PSetLayouts = (DescriptorSetLayout*)Unsafe.AsPointer(ref descriptorSetLayout)
         };
 
-        if (VkApi.CreatePipelineLayout(_device, &pipelineLayoutCreateInfo, null, out var pipelineLayout) != Result.Success)
+        if (VkApi.CreatePipelineLayout(_device, in pipelineLayoutCreateInfo, null, out var pipelineLayout) != Result.Success)
             throw new Exception("Failed to create pipeline layout!");
+
+        _pipelineLayouts.Add(Guid.NewGuid(), pipelineLayout);
 
         return pipelineLayout;
     }
 
-    public PipelineInfo CreateComputePipeLine(ShaderModuleInfo shaderInfo, PipelineLayout pipelineLayout)
+    private Pipeline CreateComputePipeline(ShaderModuleInfo shaderInfo, PipelineLayout pipelineLayout)
     {
+        if (!_shaderModules.TryGetValue(shaderInfo.Guid, out var shaderModule))
+            throw new Exception("Shader module not found!");
+
         var functionName = MarshalUtil.StringToHGlobalUtf8(shaderInfo.FunctionName);
         var pipelineShaderStageCreateInfo = new PipelineShaderStageCreateInfo
         {
             SType = StructureType.PipelineShaderStageCreateInfo,
             Stage = ShaderStageFlags.ComputeBit,
-            Module = shaderInfo.Instance,
+            Module = shaderModule,
             PName = (byte*)functionName
         };
 
@@ -460,30 +561,40 @@ unsafe class ComputeKernel
         if (VkApi.CreateComputePipelines(_device, new PipelineCache(), 1, in computePipelineCreateInfo, null, out var pipeline) != Result.Success)
             throw new Exception("Failed to create compute pipeline!");
 
+        _pipelines.Add(Guid.NewGuid(), pipeline);
+
         Marshal.FreeHGlobal(functionName);
-        var pipelineInfo = new PipelineInfo(pipelineLayout, pipeline);
-        _pipelineInfos.Add(pipelineInfo.Guid);
 
-        return pipelineInfo;
+        return pipeline;
     }
 
-    public void FreeComputePipelineLayout(PipelineLayout pipelineLayout)
+    private void FreePipelineLayout(PipelineLayout pipelineLayout)
     {
-        VkApi.DestroyPipelineLayout(_device, pipelineLayout, null);
+        if (!_pipelineLayouts.ContainsValue(pipelineLayout))
+            return;
     }
 
-    public void FreeComputePipeline(PipelineInfo pipelineInfo)
+    private void FreePipeline(ComputePipelineInfo pipelinInfo)
     {
-        if (!_pipelineInfos.Contains(pipelineInfo.Guid))
-            throw new Exception("Pipeline not found!");
-
-        VkApi.DestroyPipeline(_device, pipelineInfo.Instance, null);
-        _pipelineInfos.Remove(pipelineInfo.Guid);
+        if (!_pipelines.TryGetValue(pipelinInfo.Guid, out var pipeline))
+            return;
+        VkApi.DestroyPipeline(_device, pipeline, null);
     }
 
     #endregion
 
-    public void Execute(PipelineInfo pipelineInfo, DescriptorSet descriptorSet)
+    public void Execute<T1>(ShaderModuleInfo shaderInfo, T1 arg)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(nameof(arg));
+
+        var descriptorSet = CreateDescriptorSet(arg);
+        var pipelineLayout = CreatePipelineLayout(_descriptorSetLayouts[typeof(T1).GUID]);
+        var pipeline = CreateComputePipeline(shaderInfo, pipelineLayout);
+
+        Execute(pipeline, pipelineLayout, descriptorSet);
+    }
+
+    private void Execute(Pipeline pipeline, PipelineLayout pipelineLayout, DescriptorSet descriptorSet)
     {
         CommandBufferAllocateInfo allocateInfo = new()
         {
@@ -501,11 +612,11 @@ unsafe class ComputeKernel
             SType = StructureType.CommandBufferBeginInfo,
             Flags = CommandBufferUsageFlags.OneTimeSubmitBit
         };
-
         if (VkApi.BeginCommandBuffer(commandBuffer, &beginInfo) != Result.Success)
             throw new Exception("Failed to begin command buffer!");
-        VkApi.CmdBindPipeline(commandBuffer, PipelineBindPoint.Compute, pipelineInfo.Instance);
-        VkApi.CmdBindDescriptorSets(commandBuffer, PipelineBindPoint.Compute, pipelineInfo.Layout, 0, 1, in descriptorSet, 0, null);
+
+        VkApi.CmdBindPipeline(commandBuffer, PipelineBindPoint.Compute, pipeline);
+        VkApi.CmdBindDescriptorSets(commandBuffer, PipelineBindPoint.Compute, pipelineLayout, 0, 1, in descriptorSet, 0, null);
         VkApi.CmdDispatch(commandBuffer, 1, 1, 1);
         VkApi.EndCommandBuffer(commandBuffer);
 
@@ -522,13 +633,59 @@ unsafe class ComputeKernel
             throw new Exception("Failed to wait idle!");
     }
 
+    #region Dispose
+
+    private void FreeAllMemoryWithBuffer()
+    {
+        foreach (var buffer in _buffers.Values)
+            VkApi.DestroyBuffer(_device, buffer, null);
+        _buffers.Clear();
+
+        foreach (var memory in _memory.Values)
+            VkApi.FreeMemory(_device, memory, null);
+        _memory.Clear();
+    }
+
+    private void FreeDescriptorPoolWithLayout()
+    {
+        foreach (var descriptorSetLayout in _descriptorSetLayouts.Values)
+            VkApi.DestroyDescriptorSetLayout(_device, descriptorSetLayout, null);
+        _descriptorSetLayouts.Clear();
+
+        VkApi.DestroyDescriptorPool(_device, _descriptorPool, null);
+    }
+
+    private void FreeShaderModule()
+    {
+        foreach (var shaderModule in _shaderModules.Values)
+            VkApi.DestroyShaderModule(_device, shaderModule, null);
+        _shaderModules.Clear();
+    }
+
+    private void FreePipelineWithLayout()
+    {
+        foreach (var pipeline in _pipelines.Values)
+            VkApi.DestroyPipeline(_device, pipeline, null);
+
+        foreach (var pipelineLayout in _pipelineLayouts.Values)
+            VkApi.DestroyPipelineLayout(_device, pipelineLayout, null);
+        _pipelineLayouts.Clear();
+
+        _pipelines.Clear();
+    }
+
     public void Dispose()
     {
+        FreeShaderModule();
+        FreeAllMemoryWithBuffer();
         VkApi.DestroyCommandPool(_device, _commandPool, null);
-        VkApi.DestroyDescriptorPool(_device, _descriptorPool, null);
+
+        FreePipelineWithLayout();
+        FreeDescriptorPoolWithLayout();
         VkApi.DestroyDevice(_device, null);
         VkApi.DestroyInstance(_instance, null);
     }
+    #endregion
 
     #region Validation Layers
     private DebugUtilsMessengerCreateInfoEXT PopulateDebugMessengerCreateInfo() => new()

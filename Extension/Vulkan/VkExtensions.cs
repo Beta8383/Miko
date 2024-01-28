@@ -1,15 +1,13 @@
 using System.Diagnostics;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
-using Buffer = Silk.NET.Vulkan.Buffer;
 
 namespace Miko.Extension.Vulkan;
 
 unsafe static class VkExtensions
 {
     #region Check
-    public static bool CheckExtensionSupport(this Vk vkapi, List<string> extensionsName)
+    public static bool CheckExtensionSupport(this Vk vkapi, IEnumerable<string> extensionsName)
     {
         //Get available extensions
         Span<uint> extensionCount = stackalloc uint[1];
@@ -24,7 +22,7 @@ unsafe static class VkExtensions
         return extensionsName.All(availableExtensionNames.Contains);
     }
 
-    public unsafe static bool CheckValidationLayerSupport(this Vk vkapi, string[] layersName)
+    public unsafe static bool CheckValidationLayerSupport(this Vk vkapi, IEnumerable<string> layersName)
     {
         //Get available layers
         Span<uint> layerCount = stackalloc uint[1];
@@ -63,7 +61,7 @@ unsafe static class VkExtensions
         return Marshal.PtrToStringAnsi((nint)deviceProperties.DeviceName) ?? "Unknown Device";
     }
 
-    public static IEnumerable<(PhysicalDevice, uint)> GetPhysicalDeviceWithQueueFamilies(this Vk vkapi, Instance instance, QueueFlags flags)
+    public static IEnumerable<(PhysicalDevice, uint)?> GetPhysicalDeviceWithQueueFamilies(this Vk vkapi, Instance instance, QueueFlags flags)
     {
         Span<uint> deviceCount = stackalloc uint[1];
         vkapi.EnumeratePhysicalDevices(instance, deviceCount, (Span<PhysicalDevice>)null);
@@ -84,58 +82,16 @@ unsafe static class VkExtensions
     #endregion
 
     #region Memory
-    public static uint FindMemoryType(this Vk vkapi, PhysicalDevice device, MemoryRequirements requirements, MemoryPropertyFlags flags)
+    public static uint FindMemoryType(this Vk vkapi, PhysicalDevice device, uint memoryTypeBits, MemoryPropertyFlags flags)
     {
         PhysicalDeviceMemoryProperties memProperties;
         vkapi.GetPhysicalDeviceMemoryProperties(device, &memProperties);
 
         for (uint i = 0; i < memProperties.MemoryTypeCount; i++)
-            if ((requirements.MemoryTypeBits & (1 << (int)i)) != 0 && memProperties.MemoryTypes[(int)i].PropertyFlags.HasFlag(flags))
+            if ((memoryTypeBits & (1 << (int)i)) != 0 && memProperties.MemoryTypes[(int)i].PropertyFlags.HasFlag(flags))
                 return i;
 
         throw new Exception("Failed to find suitable memory type!");
-    }
-
-    public static DeviceMemory AllocateMemory(this Vk vkapi, PhysicalDevice physicalDevice, Device device, Buffer buffer, MemoryPropertyFlags flags)
-    {
-        MemoryRequirements memoryRequirements = vkapi.GetBufferMemoryRequirements(device, buffer);
-        Debug.WriteLine($"MemoryRequirements: Size: {memoryRequirements.Size} Alignment: {memoryRequirements.Alignment}");
-
-        MemoryAllocateInfo allocateInfo = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = memoryRequirements.Size,
-            MemoryTypeIndex = vkapi.FindMemoryType(physicalDevice, memoryRequirements, flags)
-        };
-
-        if (vkapi.AllocateMemory(device, &allocateInfo, null, out DeviceMemory memory) != Result.Success)
-            throw new Exception("Failed to allocate buffer memory!");
-
-        vkapi.BindBufferMemory(device, buffer, memory, 0);
-        return memory;
-
-    }
-
-    public static void WriteMemory<T>(this Vk vkapi, Device device, DeviceMemory memory, Span<T> data) where T : unmanaged
-    {
-        void* mappedMemory = null;
-        if (vkapi.MapMemory(device, memory, 0, (ulong)(sizeof(T) * data.Length), 0, ref mappedMemory) != Result.Success)
-            throw new Exception("Failed to map memory!");
-
-        Unsafe.CopyBlock(mappedMemory, Unsafe.AsPointer(ref data[0]), (uint)(sizeof(T) * data.Length));
-
-        vkapi.UnmapMemory(device, memory);
-    }
-
-    public static void ReadMemory<T>(this Vk vkapi, Device device, DeviceMemory memory, Span<T> data) where T : unmanaged
-    {
-        void* mappedMemory = null;
-        if (vkapi.MapMemory(device, memory, 0, (ulong)(sizeof(T) * data.Length), 0, ref mappedMemory) != Result.Success)
-            throw new Exception("Failed to map memory!");
-
-        Unsafe.CopyBlock(Unsafe.AsPointer(ref data[0]), mappedMemory, (uint)(sizeof(T) * data.Length));
-
-        vkapi.UnmapMemory(device, memory);
     }
     #endregion
 }

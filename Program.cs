@@ -1,5 +1,6 @@
 using Miko;
-using Miko.HLSLBuffer;
+using Miko.Attributes;
+using Miko.HLSLBuffers;
 
 internal class Program
 {
@@ -10,57 +11,48 @@ internal class Program
 
     struct Data
     {
-        [Binding(0)]
-        public StructuredBuffer<float> data1;
-
         [Binding(1)]
-        public ConstantBuffer<UniformBuffer> constData;
+        public RWStructuredBuffer<float> data1;
 
-        [Binding(2)]
-        public StructuredBuffer<float> result;
+        [Binding(0)]
+        public ConstantBuffer<UniformBuffer> constData;
     }
 
     private static void Main(string[] args)
     {
         const int size = 100;
-        Span<float> data1 = new float[size];
+        float[] data1 = new float[size];
         for (int i = 0; i < size; i++)
             data1[i] = i;
-        Span<uint> constData = [10];
-        Span<float> result = new float[size];
 
-        ComputeKernel kernel = new(1, true);
+        UniformBuffer constData = new() { a = 10 };
 
-        var bufferInfo1 = kernel.AllocateBuffer((ulong)(data1.Length * sizeof(float)), false);
-        kernel.WriteDataIntoBuffer(bufferInfo1, data1);
-        var constBufferInfo = kernel.AllocateBuffer((ulong)(constData.Length * sizeof(float)), true);
-        kernel.WriteDataIntoBuffer(constBufferInfo, constData);
+        using (ComputeKernel kernel = new(1, true))
+        {
 
-        var descriptorSetLayout = kernel.CreateDescriptorSetLayout(1, 2);
-        var descriptorSetInfo = kernel.AllocateDescriptorSet(descriptorSetLayout);
-        kernel.UpdateDescriptorSet(descriptorSetInfo, [constBufferInfo, bufferInfo1]);
+            Data data = new()
+            {
+                data1 = new(size),
+                constData = new(),
+            };
 
-        const string path = @"./TestShader/multiply.spv";
-        var shaderCode = File.ReadAllBytes(path);
-        var shaderModule = kernel.CreateShaderModule(shaderCode);
+            var memoryInfos = kernel.AllocateShaderBuffer(data);
 
-        var pipelineLayout = kernel.CreateComputePineLineLayout(descriptorSetLayout);
-        var pipelineInfo = kernel.CreateComputePipeLine(shaderModule, pipelineLayout);
+            kernel.WriteBuffer(data.constData, constData);
+            kernel.WriteBuffer<float>(data.data1, data1);
 
-        kernel.Execute(pipelineInfo, descriptorSetInfo);
-        kernel.ReadDataFromBuffer(bufferInfo1, result);
-        foreach (var item in result)
-            Console.Write(item + " ");
+            var shader = kernel.CreateShaderModule(File.ReadAllBytes("./TestShader/multiply.spv"));
+            kernel.Execute(shader, data);
 
+            kernel.ReadBuffer(ShaderBufferMapper<Data>.GetBuffer(data, 1), out data1);
+
+            foreach (var memoryInfo in memoryInfos)
+                kernel.FreeMemoryWithBuffers(memoryInfo);
+        }
+        
+        foreach (var d in data1)
+            Console.Write(d + " ");
         Console.WriteLine();
-
-        kernel.FreeBuffer(bufferInfo1);
-        kernel.FreeBuffer(constBufferInfo);
-        kernel.FreeDescriptorSetLayout(descriptorSetLayout);
-        kernel.FreeShaderModule(shaderModule);
-        kernel.FreeComputePipelineLayout(pipelineLayout);
-        kernel.FreeComputePipeline(pipelineInfo);
-        kernel.Dispose();
 
         Task.Delay(2000).Wait();
     }
