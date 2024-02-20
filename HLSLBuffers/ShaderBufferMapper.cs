@@ -41,11 +41,12 @@ static class ShaderBufferMapper<T>
                                   .Where(field => typeof(HLSLBuffer).IsAssignableFrom(field.FieldType)).ToArray();
 
             //get binding attributes
-            BindingAttribute?[] bindingAttribute = HLSLBufferFields.Select(field => field.GetCustomAttribute<BindingAttribute>()).ToArray();
-            if (!ValidateBinding(bindingAttribute))
-                throw new Exception("Binding Attributes are not valid");
+            BufferAttribute?[] bufferAttributes = HLSLBufferFields.Select(field => field.GetCustomAttribute<BufferAttribute>()).ToArray();
+            if (!ValidateBinding(bufferAttributes))
+                throw new Exception("Buffer Attributes are not valid");
             //get binding attributes value
-            uint[] bindingValue = bindingAttribute.Select(attribute => attribute!.Binding).ToArray();
+            uint[] bindingValue = bufferAttributes.Select(attribute => attribute!.Binding).ToArray();
+            BufferType[] bufferTypes = bufferAttributes.Select(attribute => attribute!.Type).ToArray();
             //sort binding attributes value and save in the Bindings property
             Bindings = new ReadOnlyCollection<uint>(bindingValue.OrderBy(value => value).ToArray());
 
@@ -73,7 +74,7 @@ static class ShaderBufferMapper<T>
         }
     }
 
-    private static bool ValidateBinding(BindingAttribute?[] bindingAttributes)
+    private static bool ValidateBinding(BufferAttribute?[] bindingAttributes)
     {
         //no null binding attributes and no duplicate binding attributes
         return bindingAttributes.All(bindingAttribute => bindingAttribute is not null) &&

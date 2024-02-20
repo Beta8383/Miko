@@ -44,7 +44,7 @@
         {
             "label": "compile glsl",
             "type": "shell",
-            "command": "glslc -fshader-stage=comp ${file} -o ${workspaceFolder}/shader/${fileBasenameNoExtension}.spv",
+            "command": "glslc -fshader-stage=comp ${file} -o ${workspaceFolder}/TestShader/${fileBasenameNoExtension}.spv",
             "group": "build",
             "presentation": {
                 "reveal": "always"

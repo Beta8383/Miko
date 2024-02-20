@@ -1,13 +1,16 @@
+using Silk.NET.Vulkan;
+using Buffer = Silk.NET.Vulkan.Buffer;
+
 namespace Miko.HLSLBuffers;
 
 public class HLSLBuffer
 {
-    internal Guid Id;
-    internal readonly BufferType Type;
+    public readonly BufferType Type;
     public readonly ulong Size;
 
-    internal Guid MemoryId;
-    internal ulong MemoryOffset;
+    internal DeviceMemory? Memory;
+    internal Buffer? Buffer;
+    internal ulong Offset;
 
     internal HLSLBuffer(ulong size, BufferType type)
     {
